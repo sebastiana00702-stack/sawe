@@ -7,10 +7,13 @@ per-day DataFrame the recommender already consumes (columns = the
 ``zone_minutes``/``journal`` as dicts), so no metric/rule/planner code
 changes.
 
-A small JSON cache (``data/whoop_cache.json``, 6-hour TTL) sits in front of
-the WHOOP API so iterative dev work does not hammer (or rate-limit) the
-account. The cache key includes ``days_back`` so a wider request is not
-served a narrower cached window.
+A small JSON cache (``data/whoop_cache.json``, 15-minute TTL) sits in
+front of the WHOOP API so iterative dev work does not hammer (or
+rate-limit) the account, while still surfacing a just-completed WHOOP
+sync within minutes. The cache key includes ``days_back`` so a wider
+request is not served a narrower cached window; pass
+``force_refresh=True`` to skip a still-fresh entry and re-fetch (the
+fresh result is written back).
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from src.models import WhoopDaily
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CACHE_PATH = REPO_ROOT / "data" / "whoop_cache.json"
-CACHE_TTL = timedelta(hours=6)
+CACHE_TTL = timedelta(minutes=15)
 CACHE_SCHEMA = 1
 
 #: Column order mirrors ``WhoopDaily`` so an empty result still has the
@@ -123,19 +126,23 @@ def load_whoop_history(
     client: Optional[Any] = None,
     cache_path: Path = CACHE_PATH,
     use_cache: bool = True,
+    force_refresh: bool = False,
     now: Optional[datetime] = None,
 ) -> pd.DataFrame:
     """Return the last ``days_back`` days of WHOOP data as a DataFrame.
 
-    Serves a fresh on-disk cache when one exists (<6 h old and at least as
-    wide as ``days_back``); otherwise fetches via WHOOP and refreshes the
-    cache. ``client`` is injectable for tests; when omitted a
-    :class:`WhoopClient` is constructed from the environment and closed
-    after use. Drop-in for ``pd.read_csv('data/fake_whoop.csv')``.
+    Serves a fresh on-disk cache when one exists (<15 min old and at least
+    as wide as ``days_back``); otherwise fetches via WHOOP and refreshes
+    the cache. ``force_refresh=True`` skips a still-fresh entry and forces
+    a live fetch, writing the result back so the next call within TTL is a
+    hit again (distinct from ``use_cache=False``, which neither reads nor
+    writes the cache at all). ``client`` is injectable for tests; when
+    omitted a :class:`WhoopClient` is constructed from the environment and
+    closed after use. Drop-in for ``pd.read_csv('data/fake_whoop.csv')``.
     """
     now = now or _now()
 
-    if use_cache:
+    if use_cache and not force_refresh:
         blob = _read_cache(cache_path)
         if blob is not None and _cache_fresh(blob, days_back, now):
             cached = [

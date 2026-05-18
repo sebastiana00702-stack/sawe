@@ -9,13 +9,15 @@ calls**. Covers:
 * client: OAuth refresh on 401, 401-after-refresh → auth error, 429
   backoff + exhaustion, ``next_token`` pagination, per-endpoint paths,
   missing-credential failure, network error;
-* loader: 6-hour disk cache (hit / stale / bypass);
-* API: ``GET /me/today`` happy path + WHOOP-error status mapping.
+* loader: 15-minute disk cache (hit / stale / bypass / force-refresh);
+* API: ``GET /me/today`` happy path, ``?refresh`` propagation, the
+  ``meta.data_freshness`` staleness indicator, and WHOOP-error mapping.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -45,13 +47,24 @@ CREDS = dict(
 )
 
 
+def uid(seed: int) -> str:
+    """A deterministic v2-style UUID string from a small int seed.
+
+    WHOOP v2 resource IDs are UUID strings, not v1 integers. The tests
+    still pass terse int seeds for readability; equal seeds must map to
+    equal UUIDs so the recovery→cycle / recovery→sleep equality joins in
+    ``merge_history`` keep lining up exactly as they did with int IDs.
+    """
+    return str(uuid.UUID(int=seed))
+
+
 # ==========================================================================
 # WHOOP JSON fixture builders
 # ==========================================================================
 
 def recovery_rec(
-    cycle_id: int,
-    sleep_id: int,
+    cycle_id: str,
+    sleep_id: str,
     *,
     recovery: int = 70,
     hrv: float = 65.0,
@@ -81,7 +94,7 @@ def recovery_rec(
 
 
 def cycle_rec(
-    cycle_id: int,
+    cycle_id: str,
     day: date,
     *,
     strain: float = 10.0,
@@ -105,7 +118,7 @@ def cycle_rec(
 
 
 def sleep_rec(
-    sleep_id: int,
+    sleep_id: str,
     *,
     perf: float = 90.0,
     rr: float = 14.5,
@@ -159,7 +172,7 @@ def workout_rec(
 ) -> dict:
     m = 60_000
     return {
-        "id": 9000 + day.toordinal() % 1000,
+        "id": uid(day.toordinal()),
         "user_id": 1,
         "start": f"{day.isoformat()}T17:00:00.000Z",
         "end": f"{day.isoformat()}T18:00:00.000Z",
@@ -194,9 +207,9 @@ def workout_rec(
 def test_normalize_full_day_maps_every_field():
     d = date(2026, 5, 18)
     wd = normalize_whoop_day(
-        recovery_rec(1, 1, recovery=72, hrv=66.5, rhr=47),
-        cycle_rec(1, d, strain=12.3),
-        sleep_rec(1, perf=88.0, rr=15.0, rem=95, sws=85, light=310, need_h=8.2),
+        recovery_rec(uid(1), uid(1), recovery=72, hrv=66.5, rhr=47),
+        cycle_rec(uid(1), d, strain=12.3),
+        sleep_rec(uid(1), perf=88.0, rr=15.0, rem=95, sws=85, light=310, need_h=8.2),
         [workout_rec(d, strain=9.4, hr_mean=152, hr_max=178, z1=25, z3=12)],
     )
     assert isinstance(wd, WhoopDaily)
@@ -222,7 +235,7 @@ def test_normalize_full_day_maps_every_field():
 def test_normalize_no_workout_day_defaults_workout_fields():
     d = date(2026, 5, 18)
     wd = normalize_whoop_day(
-        recovery_rec(2, 2), cycle_rec(2, d), sleep_rec(2), []
+        recovery_rec(uid(2), uid(2)), cycle_rec(uid(2), d), sleep_rec(uid(2)), []
     )
     assert wd.workout_strain is None
     assert wd.workout_hr_mean is None
@@ -235,9 +248,9 @@ def test_normalize_no_workout_day_defaults_workout_fields():
 def test_normalize_summarizes_hardest_workout_and_sums_zones():
     d = date(2026, 5, 18)
     wd = normalize_whoop_day(
-        recovery_rec(3, 3),
-        cycle_rec(3, d),
-        sleep_rec(3),
+        recovery_rec(uid(3), uid(3)),
+        cycle_rec(uid(3), d),
+        sleep_rec(uid(3)),
         [
             workout_rec(d, strain=5.0, hr_mean=130, hr_max=150, z1=10, z3=0),
             workout_rec(d, strain=11.0, hr_mean=165, hr_max=185, z1=5, z3=8),
@@ -255,18 +268,18 @@ def test_normalize_unscored_recovery_raises():
     d = date(2026, 5, 18)
     with pytest.raises(NormalizationError):
         normalize_whoop_day(
-            recovery_rec(4, 4, state="PENDING_SCORE"),
-            cycle_rec(4, d),
-            sleep_rec(4),
+            recovery_rec(uid(4), uid(4), state="PENDING_SCORE"),
+            cycle_rec(uid(4), d),
+            sleep_rec(uid(4)),
             [],
         )
 
 
 def test_normalize_applies_timezone_offset_to_date():
     # 02:00 UTC with a -05:00 offset is still the previous local day.
-    rec = recovery_rec(5, 5)
-    cyc = cycle_rec(5, date(2026, 5, 18), tz="-05:00", start_hour=2)
-    wd = normalize_whoop_day(rec, cyc, sleep_rec(5), [])
+    rec = recovery_rec(uid(5), uid(5))
+    cyc = cycle_rec(uid(5), date(2026, 5, 18), tz="-05:00", start_hour=2)
+    wd = normalize_whoop_day(rec, cyc, sleep_rec(uid(5)), [])
     assert wd.date == date(2026, 5, 17)
 
 
@@ -274,7 +287,7 @@ def test_normalize_nonpositive_hrv_raises():
     d = date(2026, 5, 18)
     with pytest.raises(NormalizationError):
         normalize_whoop_day(
-            recovery_rec(6, 6, hrv=0.0), cycle_rec(6, d), sleep_rec(6), []
+            recovery_rec(uid(6), uid(6), hrv=0.0), cycle_rec(uid(6), d), sleep_rec(uid(6)), []
         )
 
 
@@ -314,17 +327,17 @@ def test_merge_history_links_sorts_and_skips_incomplete():
     d1, d2, d3 = date(2026, 5, 16), date(2026, 5, 17), date(2026, 5, 18)
     client = FakeClient(
         recoveries=[
-            recovery_rec(30, 30, recovery=60),  # d3 (out of order first)
-            recovery_rec(10, 10, recovery=80),  # d1
-            recovery_rec(20, 20, state="UNSCORABLE"),  # d2 → skipped
-            recovery_rec(40, 40),  # cycle 40 missing → skipped
+            recovery_rec(uid(30), uid(30), recovery=60),  # d3 (out of order first)
+            recovery_rec(uid(10), uid(10), recovery=80),  # d1
+            recovery_rec(uid(20), uid(20), state="UNSCORABLE"),  # d2 → skipped
+            recovery_rec(uid(40), uid(40)),  # cycle 40 missing → skipped
         ],
         cycles=[
-            cycle_rec(10, d1),
-            cycle_rec(20, d2),
-            cycle_rec(30, d3),
+            cycle_rec(uid(10), d1),
+            cycle_rec(uid(20), d2),
+            cycle_rec(uid(30), d3),
         ],
-        sleeps=[sleep_rec(10), sleep_rec(20), sleep_rec(30)],
+        sleeps=[sleep_rec(uid(10)), sleep_rec(uid(20)), sleep_rec(uid(30))],
         workouts=[workout_rec(d1, strain=7.0)],
     )
     series = merge_history(d1, d3, client)
@@ -377,7 +390,7 @@ def test_client_refreshes_token_on_401_then_retries():
         if calls["recovery"] == 1:
             return httpx.Response(401, json={"error": "expired"})
         return httpx.Response(
-            200, json={"records": [recovery_rec(1, 1)], "next_token": None}
+            200, json={"records": [recovery_rec(uid(1), uid(1))], "next_token": None}
         )
 
     client = make_client(handler)
@@ -412,6 +425,67 @@ def test_client_refresh_rejected_raises_auth_error():
         )
 
 
+def test_client_persists_rotated_refresh_token_to_env(tmp_path):
+    # auth_setup wrote this: comments + creds + unrelated profile keys.
+    env = tmp_path / ".env"
+    env.write_text(
+        "# WHOOP API credentials.\n"
+        "WHOOP_CLIENT_ID=cid\n"
+        "WHOOP_REFRESH_TOKEN=rtoken\n"
+        "# trailing comment\n"
+        "SAWE_TIER=intermediate\n"
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if _is_token(req):
+            # WHOOP rotates: the response carries a brand-new refresh token.
+            return _ok_token("new_token")
+        return httpx.Response(
+            200, json={"records": [recovery_rec(uid(1), uid(1))]}
+        )
+
+    client = make_client(handler, env_path=env)
+    client.get_recovery(date(2026, 5, 1), date(2026, 5, 18))
+
+    # 1. In-memory state rotated, so this process keeps working.
+    assert client.refresh_token == "new_token"
+
+    # 2. .env rewritten so the *next* process does too — old token gone.
+    contents = env.read_text()
+    assert "WHOOP_REFRESH_TOKEN=new_token\n" in contents
+    assert "rtoken" not in contents
+
+    # 3. Every other line preserved byte-for-byte (it is an in-place edit,
+    #    not a regenerated file).
+    assert "# WHOOP API credentials.\n" in contents
+    assert "WHOOP_CLIENT_ID=cid\n" in contents
+    assert "# trailing comment\n" in contents
+    assert "SAWE_TIER=intermediate\n" in contents
+
+    # 4. Atomic swap left no partial temp file behind.
+    assert [p.name for p in tmp_path.iterdir()] == [".env"]
+
+
+def test_client_does_not_rewrite_env_when_token_unchanged(tmp_path):
+    # WHOOP may return the *same* refresh token (or none) — then there is
+    # nothing to persist and the file must be left strictly untouched.
+    env = tmp_path / ".env"
+    env.write_text("WHOOP_REFRESH_TOKEN=rtoken\n")
+    before = env.stat().st_mtime_ns
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if _is_token(req):
+            return _ok_token("rtoken")  # unchanged
+        return httpx.Response(200, json={"records": []})
+
+    client = make_client(handler, env_path=env)
+    client.get_recovery(date(2026, 5, 1), date(2026, 5, 18))
+
+    assert client.refresh_token == "rtoken"
+    assert env.read_text() == "WHOOP_REFRESH_TOKEN=rtoken\n"
+    assert env.stat().st_mtime_ns == before  # not rewritten at all
+
+
 def test_client_429_backs_off_then_succeeds():
     slept: list[float] = []
     state = {"n": 0}
@@ -424,7 +498,7 @@ def test_client_429_backs_off_then_succeeds():
             return httpx.Response(
                 429, headers={"Retry-After": "1"}, json={"error": "slow"}
             )
-        return httpx.Response(200, json={"records": [recovery_rec(1, 1)]})
+        return httpx.Response(200, json={"records": [recovery_rec(uid(1), uid(1))]})
 
     client = make_client(handler, sleep=slept.append)
     out = client.get_recovery(date(2026, 5, 1), date(2026, 5, 18))
@@ -456,16 +530,16 @@ def test_client_paginates_next_token():
         if "nextToken" not in req.url.params:
             return httpx.Response(
                 200,
-                json={"records": [recovery_rec(1, 1)], "next_token": "pg2"},
+                json={"records": [recovery_rec(uid(1), uid(1))], "next_token": "pg2"},
             )
         return httpx.Response(
-            200, json={"records": [recovery_rec(2, 2)], "next_token": None}
+            200, json={"records": [recovery_rec(uid(2), uid(2))], "next_token": None}
         )
 
     out = make_client(handler).get_recovery(
         date(2026, 5, 1), date(2026, 5, 18)
     )
-    assert [r["cycle_id"] for r in out] == [1, 2]
+    assert [r["cycle_id"] for r in out] == [uid(1), uid(2)]
 
 
 def test_client_methods_hit_expected_paths():
@@ -485,10 +559,10 @@ def test_client_methods_hit_expected_paths():
     c.get_workouts(s, e)
 
     assert seen == [
-        "/developer/v1/recovery",
-        "/developer/v1/cycle",
-        "/developer/v1/activity/sleep",
-        "/developer/v1/activity/workout",
+        "/developer/v2/recovery",
+        "/developer/v2/cycle",
+        "/developer/v2/activity/sleep",
+        "/developer/v2/activity/workout",
     ]
 
 
@@ -537,9 +611,9 @@ def test_client_passes_window_params():
 
 def _client_for(days: list[date]) -> FakeClient:
     return FakeClient(
-        recoveries=[recovery_rec(i, i) for i, _ in enumerate(days, 1)],
-        cycles=[cycle_rec(i, d) for i, d in enumerate(days, 1)],
-        sleeps=[sleep_rec(i) for i, _ in enumerate(days, 1)],
+        recoveries=[recovery_rec(uid(i), uid(i)) for i, _ in enumerate(days, 1)],
+        cycles=[cycle_rec(uid(i), d) for i, d in enumerate(days, 1)],
+        sleeps=[sleep_rec(uid(i)) for i, _ in enumerate(days, 1)],
         workouts=[],
     )
 
@@ -564,7 +638,7 @@ def test_loader_fetches_then_serves_fresh_cache(tmp_path):
         2,
         client=Boom(),
         cache_path=cache,
-        now=now + timedelta(hours=5),
+        now=now + timedelta(minutes=10),  # still inside the 15-min TTL
     )
     pd.testing.assert_frame_equal(df1, df2)
 
@@ -580,11 +654,52 @@ def test_loader_refetches_when_cache_stale(tmp_path):
         2,
         client=fresh,
         cache_path=cache,
-        now=now + timedelta(hours=7),  # past the 6-hour TTL
+        now=now + timedelta(minutes=20),  # past the 15-minute TTL
     )
     # Stale → the new client was actually consulted (and the loader
     # closed nothing it did not own).
     assert fresh.closed is False
+
+
+def test_loader_force_refresh_bypasses_fresh_cache(tmp_path):
+    cache = tmp_path / "whoop_cache.json"
+    days = [date(2026, 5, 17), date(2026, 5, 18)]
+    now = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+
+    load_whoop_history(2, client=_client_for(days), cache_path=cache, now=now)
+    assert cache.exists()  # a still-fresh cache entry now exists
+
+    # force_refresh must re-fetch even though the cache is fresh: a client
+    # that explodes on any access proves the cache read was skipped.
+    class Boom:
+        def __getattr__(self, _n):
+            raise AssertionError("force_refresh did not bypass the cache")
+
+    with pytest.raises(AssertionError, match="did not bypass"):
+        load_whoop_history(
+            2,
+            client=Boom(),
+            cache_path=cache,
+            force_refresh=True,
+            now=now + timedelta(minutes=1),
+        )
+
+    # ...and the freshly fetched result is written back, so the next
+    # normal call within TTL is a cache hit again (distinct from
+    # use_cache=False, which would never repopulate the cache).
+    fresh = _client_for(days)
+    df = load_whoop_history(
+        2,
+        client=fresh,
+        cache_path=cache,
+        force_refresh=True,
+        now=now + timedelta(minutes=2),
+    )
+    assert list(df["date"]) == days
+    df_hit = load_whoop_history(
+        2, client=Boom(), cache_path=cache, now=now + timedelta(minutes=5)
+    )
+    pd.testing.assert_frame_equal(df, df_hit)
 
 
 def test_loader_use_cache_false_bypasses(tmp_path):
@@ -698,3 +813,73 @@ def test_me_today_maps_whoop_errors(api_client, monkeypatch, exc, status):
     resp = api_client.get("/me/today")
     assert resp.status_code == status
     assert "detail" in resp.json()
+
+
+def test_me_today_meta_marks_fresh_when_whoop_synced_today(
+    api_client, monkeypatch
+):
+    # Freshest WHOOP row == wall-clock day → not stale.
+    monkeypatch.setattr(
+        "src.api.main.load_whoop_history", lambda *_a, **_k: _history_frame()
+    )
+    monkeypatch.setattr(
+        "src.api.main._wall_clock_today", lambda: date(2026, 5, 18)
+    )
+    resp = api_client.get("/me/today")
+    assert resp.status_code == 200, resp.text
+
+    fresh = resp.json()["meta"]["data_freshness"]
+    assert fresh["wall_clock_today"] == "2026-05-18"
+    assert fresh["latest_whoop_date"] == "2026-05-18"
+    assert fresh["days_behind"] == 0
+    assert fresh["is_stale"] is False
+    assert "current" in fresh["note"]
+
+
+def test_me_today_meta_flags_stale_when_whoop_not_synced(
+    api_client, monkeypatch
+):
+    # Freshest WHOOP row is 2026-05-17 but the wall clock is 2026-05-18:
+    # WHOOP has not synced today's recovery yet → one day behind, stale.
+    stale = _history_frame()
+    stale["date"] = stale["date"].map(lambda d: d - timedelta(days=1))
+    monkeypatch.setattr(
+        "src.api.main.load_whoop_history", lambda *_a, **_k: stale
+    )
+    monkeypatch.setattr(
+        "src.api.main._wall_clock_today", lambda: date(2026, 5, 18)
+    )
+    resp = api_client.get("/me/today")
+    assert resp.status_code == 200, resp.text
+
+    payload = resp.json()
+    fresh = payload["meta"]["data_freshness"]
+    assert fresh["wall_clock_today"] == "2026-05-18"
+    assert fresh["latest_whoop_date"] == "2026-05-17"
+    assert fresh["days_behind"] == 1
+    assert fresh["is_stale"] is True
+    assert "2026-05-17" in fresh["note"]
+    # The recommendation itself is unchanged — still dated to the WHOOP
+    # record, proving data_freshness is metadata only (CLAUDE.md).
+    assert payload["recommendation"]["date"] == "2026-05-17"
+
+
+def test_me_today_refresh_query_propagates_force_refresh(
+    api_client, monkeypatch
+):
+    seen: dict = {}
+
+    def fake_loader(days_back=90, **kwargs):
+        seen["force_refresh"] = kwargs.get("force_refresh", False)
+        return _history_frame()
+
+    monkeypatch.setattr("src.api.main.load_whoop_history", fake_loader)
+    monkeypatch.setattr(
+        "src.api.main._wall_clock_today", lambda: date(2026, 5, 18)
+    )
+
+    api_client.get("/me/today")
+    assert seen["force_refresh"] is False
+
+    api_client.get("/me/today?refresh=true")
+    assert seen["force_refresh"] is True

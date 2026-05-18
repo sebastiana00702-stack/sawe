@@ -20,8 +20,11 @@ http://127.0.0.1:8000/healthz.
 
 from __future__ import annotations
 
+from datetime import date
+from typing import Optional
+
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -32,6 +35,7 @@ from src.api.schemas import (
     AGENT_VERSION,
     DailyRecommendationRequest,
     DailyRecommendationResponse,
+    DataFreshness,
     HealthResponse,
     Meta,
     WeeklyPlanRequest,
@@ -175,9 +179,46 @@ async def _whoop_error_handler(
     )
 
 
-def _meta() -> Meta:
-    """Fresh per-response metadata (new UTC timestamp each call)."""
-    return Meta()
+def _meta(data_freshness: Optional[DataFreshness] = None) -> Meta:
+    """Fresh per-response metadata (new UTC timestamp each call).
+
+    ``data_freshness`` is supplied only by ``GET /me/today`` (the
+    live-WHOOP endpoint); it stays ``None`` — serialized as ``null`` — for
+    the request-body endpoints, whose input freshness the caller controls.
+    """
+    return Meta(data_freshness=data_freshness)
+
+
+def _wall_clock_today() -> date:
+    """Server-local calendar date (indirection so tests can pin it)."""
+    return date.today()
+
+
+def _data_freshness(latest_whoop_date: date) -> DataFreshness:
+    """Compare the freshest WHOOP record against the wall clock.
+
+    Pure transparency metadata: the recommender always runs on the most
+    recent WHOOP row regardless — this only tells the caller how far that
+    row trails today. No training logic, no behavioral change, here
+    (``CLAUDE.md``: the API stays a thin layer over deterministic rules).
+    """
+    wall = _wall_clock_today()
+    days_behind = (wall - latest_whoop_date).days
+    is_stale = days_behind >= 1
+    if is_stale:
+        note = (
+            "WHOOP has not yet synced today's recovery. The recommendation "
+            f"below reflects {latest_whoop_date.isoformat()} data."
+        )
+    else:
+        note = f"WHOOP data is current as of {latest_whoop_date.isoformat()}."
+    return DataFreshness(
+        wall_clock_today=wall,
+        latest_whoop_date=latest_whoop_date,
+        days_behind=days_behind,
+        is_stale=is_stale,
+        note=note,
+    )
 
 
 def _whoop_row_to_model(row: pd.Series) -> WhoopDaily:
@@ -262,23 +303,33 @@ async def daily_recommendation(
     summary="Today's recommendation from live WHOOP data",
     description=(
         "Pull the configured athlete's WHOOP history (last 90 days, "
-        "disk-cached 6 h) and run the Phase 5 deterministic orchestrator "
-        "for today. No request body: WHOOP auth is via environment "
-        "credentials and the runner profile comes from `SAWE_*` env vars "
-        "(documented defaults otherwise). The data layer is the only "
-        "thing new here — the recommender, rules, metrics, and planner "
-        "are unchanged and the `Recommendation` is returned verbatim. "
+        "disk-cached 15 min; pass `?refresh=true` to bypass the cache and "
+        "force a live re-fetch) and run the Phase 5 deterministic "
+        "orchestrator for today. No request body: WHOOP auth is via "
+        "environment credentials and the runner profile comes from "
+        "`SAWE_*` env vars (documented defaults otherwise). The data "
+        "layer is the only thing new here — the recommender, rules, "
+        "metrics, and planner are unchanged and the `Recommendation` is "
+        "returned verbatim; `meta.data_freshness` reports how far the "
+        "latest WHOOP record trails the wall clock without altering it. "
         "Upstream WHOOP failures map to 401 (auth), 429 (rate limit), or "
         "502 (network/API)."
     ),
 )
 async def me_today(
+    refresh: bool = Query(
+        False,
+        description=(
+            "Bypass the 15-minute disk cache and force a fresh WHOOP "
+            "fetch (the fresh result is written back to the cache)."
+        ),
+    ),
     profile: RunnerProfile = Depends(get_runner_profile),
 ) -> DailyRecommendationResponse:
     # Data layer only (WhoopClient + normalizer behind the cache); the
     # recommender wiring below is identical to /daily_recommendation —
     # no training logic is introduced in the API (CLAUDE.md).
-    history = load_whoop_history(90)
+    history = load_whoop_history(90, force_refresh=refresh)
     if history.empty:
         raise HTTPException(
             status_code=503,
@@ -300,8 +351,11 @@ async def me_today(
     recommendation = recommend_daily_workout(
         today, history_df, profile, plan
     )
+    # Pure metadata: how far today's WHOOP record trails the wall clock.
+    # The recommendation above is computed identically with or without it.
     return DailyRecommendationResponse(
-        meta=_meta(), recommendation=recommendation
+        meta=_meta(data_freshness=_data_freshness(today.date)),
+        recommendation=recommendation,
     )
 
 

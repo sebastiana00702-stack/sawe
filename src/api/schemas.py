@@ -30,6 +30,40 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class DataFreshness(BaseModel):
+    """How current the WHOOP data behind a recommendation is.
+
+    Pure caller-transparency metadata. The recommender always runs on the
+    most recent WHOOP record regardless; this block only reports how far
+    that record trails the wall clock so a caller can tell when WHOOP has
+    not yet synced today's recovery. Per ``CLAUDE.md`` it carries **no
+    training logic** and never changes the recommendation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    wall_clock_today: date = Field(
+        description="Server-local calendar date the response was built on."
+    )
+    latest_whoop_date: date = Field(
+        description=(
+            "Date of the most recent WHOOP record the recommendation used."
+        )
+    )
+    days_behind: int = Field(
+        description="``wall_clock_today - latest_whoop_date`` in days."
+    )
+    is_stale: bool = Field(
+        description=(
+            "True when ``days_behind >= 1`` — today's recovery is not yet "
+            "synced and the recommendation reflects an earlier day."
+        )
+    )
+    note: str = Field(
+        description="Human-readable explanation of the freshness state."
+    )
+
+
 class Meta(BaseModel):
     """Per-response server metadata (not part of the domain model)."""
 
@@ -41,6 +75,14 @@ class Meta(BaseModel):
     )
     agent_version: str = Field(
         default=AGENT_VERSION, description="Recommender/agent version."
+    )
+    data_freshness: Optional[DataFreshness] = Field(
+        default=None,
+        description=(
+            "WHOOP data-staleness indicator. Populated only by "
+            "`GET /me/today` (the live-WHOOP endpoint); `null` on the "
+            "request-body endpoints, whose data the caller already owns."
+        ),
     )
 
 
