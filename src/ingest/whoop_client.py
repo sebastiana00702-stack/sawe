@@ -18,9 +18,12 @@ WHOOP API reference: https://developer.whoop.com/api
 from __future__ import annotations
 
 import os
+import stat
+import tempfile
 import time
 from datetime import date, datetime, time as dtime, timedelta, timezone
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional, Union
 
 import httpx
 from dotenv import load_dotenv
@@ -36,14 +39,17 @@ WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 #: OAuth 2.0 authorization endpoint (used only by :mod:`auth_setup`).
 WHOOP_AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 
-# v1 collection paths. The Phase 7 brief lists these as /v1/recovery,
-# /v1/cycle, /v1/sleep, /v1/workout; the live API namespaces the two
-# activity collections under /v1/activity/*. Named here so a path change
+# v2 collection paths. WHOOP deprecated the v1 API in October 2025 and
+# every /v1/* call now 404s, so all four collections moved to /v2/*; the
+# two activity collections stay namespaced under /v2/activity/*. Recovery
+# in v2 is also reachable per-cycle (GET /v2/cycle/{cycleId}/recovery),
+# but the paginated /v2/recovery collection still exists and is the cheap
+# bulk path, so get_recovery keeps using it. Named here so a path change
 # is one edit and the test fixtures key off the same constants.
-RECOVERY_PATH = "/v1/recovery"
-CYCLE_PATH = "/v1/cycle"
-SLEEP_PATH = "/v1/activity/sleep"
-WORKOUT_PATH = "/v1/activity/workout"
+RECOVERY_PATH = "/v2/recovery"
+CYCLE_PATH = "/v2/cycle"
+SLEEP_PATH = "/v2/activity/sleep"
+WORKOUT_PATH = "/v2/activity/workout"
 
 #: Scopes requested at authorization time. ``offline`` is what makes WHOOP
 #: issue a refresh token at all (without it there is nothing to persist).
@@ -59,6 +65,13 @@ MAX_RATE_LIMIT_RETRIES = 4
 #: Cap on a single backoff sleep (seconds) so a bad Retry-After can't hang.
 MAX_BACKOFF_SECONDS = 60.0
 DEFAULT_TIMEOUT = 30.0
+
+#: ``.env`` written by :mod:`auth_setup` and rewritten in place whenever
+#: WHOOP rotates the refresh token. Resolved the same way auth_setup does
+#: (repo root) so both ends agree on a single file.
+DEFAULT_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+#: The one key we ever rewrite; comments and every other line are kept.
+_REFRESH_TOKEN_KEY = "WHOOP_REFRESH_TOKEN"
 
 
 # --------------------------------------------------------------------------
@@ -147,11 +160,24 @@ class WhoopClient:
         max_rate_limit_retries: int = MAX_RATE_LIMIT_RETRIES,
         timeout: float = DEFAULT_TIMEOUT,
         load_env: bool = True,
+        env_path: Optional[Union[str, os.PathLike[str]]] = None,
     ) -> None:
+        # The file we both read credentials from and rewrite the rotated
+        # refresh token into. An explicit path always wins (tests point it
+        # at a tmp file); otherwise the repo `.env` — but only when env
+        # hydration is on, so a transport-injected unit test never touches
+        # a real file.
+        if env_path is not None:
+            self._env_path: Optional[Path] = Path(env_path)
+        elif load_env:
+            self._env_path = DEFAULT_ENV_PATH
+        else:
+            self._env_path = None
+
         if load_env and transport is None:
             # Hydrate a local .env when running for real; tests inject a
             # transport and explicit creds, so skip the side effect there.
-            load_dotenv()
+            load_dotenv(self._env_path)
 
         self.client_id = client_id or os.environ.get("WHOOP_CLIENT_ID")
         self.client_secret = (
@@ -201,9 +227,12 @@ class WhoopClient:
     def _refresh_access_token(self) -> None:
         """Exchange the stored refresh token for a fresh access token.
 
-        WHOOP rotates refresh tokens, so the new one (when returned) is kept
-        for the next refresh within this process's lifetime. A 4xx here is
-        unrecoverable (bad/expired credentials) → :class:`WhoopAuthError`.
+        WHOOP rotates the refresh token on every use (RFC 6749 §6), so the
+        old one is single-use: the response carries a *new* ``refresh_token``
+        that must replace it both in memory (this process) and on disk (the
+        next process). We update ``self.refresh_token`` and rewrite ``.env``
+        before the rotated token can be spent. A 4xx here is unrecoverable
+        (bad/expired credentials) → :class:`WhoopAuthError`.
         """
         data = {
             "grant_type": "refresh_token",
@@ -241,8 +270,78 @@ class WhoopClient:
             ) from exc
 
         rotated = payload.get("refresh_token")
-        if rotated:
+        if rotated and rotated != self.refresh_token:
             self.refresh_token = rotated
+            self._persist_refresh_token(rotated)
+
+    def _persist_refresh_token(self, token: str) -> None:
+        """Atomically rewrite ``WHOOP_REFRESH_TOKEN`` in the ``.env`` file.
+
+        WHOOP just invalidated the previous refresh token; if the process
+        dies before this lands, the next start reads a dead token and every
+        call 401s. The write therefore has to be crash-safe: render the full
+        new file content, write it to a sibling temp file, ``fsync`` it, then
+        ``os.replace`` it over ``.env`` — a single atomic rename on POSIX, so
+        a reader never sees a truncated or half-written secrets file.
+
+        Every non-target line (comments, the other ``SAWE_*`` keys) is kept
+        byte-for-byte; only the one ``WHOOP_REFRESH_TOKEN`` line changes (it
+        is appended if somehow absent). Persistence is best-effort: if there
+        is no env file to update (env-var-only deployment) or the rewrite
+        fails, the in-memory token still carries this process, so we never
+        turn a fetch into a hard failure over a disk hiccup.
+        """
+        env_path = self._env_path
+        if env_path is None or not env_path.exists():
+            return
+
+        try:
+            original = env_path.read_text()
+            lines = original.splitlines(keepends=True)
+            new_line = f"{_REFRESH_TOKEN_KEY}={token}\n"
+
+            replaced = False
+            for i, line in enumerate(lines):
+                # `KEY=...`, tolerating leading whitespace; never a comment.
+                bare = line.lstrip()
+                if bare.startswith(f"{_REFRESH_TOKEN_KEY}=") or bare.startswith(
+                    f"{_REFRESH_TOKEN_KEY} ="
+                ):
+                    lines[i] = new_line
+                    replaced = True
+                    break
+            if not replaced:
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(new_line)
+            new_content = "".join(lines)
+
+            # Temp file in the *same directory* so os.replace is a same-
+            # filesystem (atomic) rename, not a cross-device copy.
+            fd, tmp = tempfile.mkstemp(
+                prefix=".env.", suffix=".tmp", dir=str(env_path.parent)
+            )
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(new_content)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                # Carry the original mode over (secrets file is often 0600).
+                try:
+                    os.chmod(tmp, stat.S_IMODE(env_path.stat().st_mode))
+                except OSError:
+                    pass
+                os.replace(tmp, env_path)
+            except BaseException:
+                # Never leave a stray partial temp file behind.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            # Best-effort: in-memory token already updated for this process.
+            return
 
     # -- request plumbing --------------------------------------------------
 

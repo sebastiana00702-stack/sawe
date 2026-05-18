@@ -19,7 +19,12 @@ Field-mapping notes (framework.md §8 semantics):
 * ``skin_temp_dev_c`` is intentionally ``None``: WHOOP's API exposes an
   *absolute* skin temperature, never the personal-baseline *deviation*
   the framework defines, and a single record cannot establish a baseline.
-* ``journal`` is ``{}``: WHOOP v1 has no public journal collection.
+* ``journal`` is ``{}``: WHOOP's API exposes no public journal collection.
+
+v2 note: WHOOP's v2 resource IDs (``cycle_id``, ``sleep_id``,
+``workout_id``) are UUID strings rather than v1 integers. The
+recovery→cycle and recovery→sleep links below are plain equality lookups,
+so they are unaffected — string keys compare just as integer keys did.
 """
 
 from __future__ import annotations
@@ -201,7 +206,7 @@ def normalize_whoop_day(
         respiratory_rate=_clamp(respiratory_rate, 0.001, 40.0),
         # WHOOP exposes absolute skin temp, not a baseline deviation — the
         # framework's field is a deviation, so it stays None (see module
-        # docstring). journal has no v1 collection endpoint.
+        # docstring). journal has no public collection endpoint.
         skin_temp_dev_c=None,
         journal={},
     )
