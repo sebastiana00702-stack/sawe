@@ -7,3 +7,4 @@ sqlalchemy
 apscheduler
 pytest
 httpx
+python-dotenv

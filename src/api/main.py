@@ -21,13 +21,13 @@ http://127.0.0.1:8000/healthz.
 from __future__ import annotations
 
 import pandas as pd
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from src.agent import recommend_daily_workout
-from src.api.deps import get_agent_version
+from src.api.deps import get_agent_version, get_runner_profile
 from src.api.schemas import (
     AGENT_VERSION,
     DailyRecommendationRequest,
@@ -37,7 +37,23 @@ from src.api.schemas import (
     WeeklyPlanRequest,
     WeeklyPlanResponse,
 )
+from src.ingest.loaders import load_whoop_history
+from src.ingest.whoop_client import (
+    WhoopAuthError,
+    WhoopError,
+    WhoopRateLimitError,
+)
+from src.models import RunnerProfile, WhoopDaily
 from src.planner.weekly_plan import generate_weekly_plan
+
+# Optional WhoopDaily fields: a DataFrame round-trip turns an absent value
+# into float NaN, which the schema rejects — coerce those back to None.
+_OPTIONAL_WHOOP_FIELDS = (
+    "workout_strain",
+    "workout_hr_mean",
+    "workout_hr_max",
+    "skin_temp_dev_c",
+)
 
 app = FastAPI(
     title="Sawe — Running Coach Agent",
@@ -123,9 +139,60 @@ async def _value_error_handler(
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
+@app.exception_handler(WhoopAuthError)
+async def _whoop_auth_handler(
+    request: Request, exc: WhoopAuthError
+) -> JSONResponse:
+    """WHOOP credentials are missing/expired → 401, not a 500.
+
+    The athlete must re-run ``auth_setup``; surface that verbatim rather
+    than leaking it as an opaque server fault.
+    """
+    return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+
+@app.exception_handler(WhoopRateLimitError)
+async def _whoop_rate_limit_handler(
+    request: Request, exc: WhoopRateLimitError
+) -> JSONResponse:
+    """WHOOP rate limit not cleared after retries → propagate 429."""
+    return JSONResponse(status_code=429, content={"detail": str(exc)})
+
+
+@app.exception_handler(WhoopError)
+async def _whoop_error_handler(
+    request: Request, exc: WhoopError
+) -> JSONResponse:
+    """Any other upstream WHOOP failure (network / API) → 502.
+
+    Registered after the specific subclasses; Starlette resolves handlers
+    by the exception MRO so :class:`WhoopAuthError` /
+    :class:`WhoopRateLimitError` still win for their own types.
+    """
+    return JSONResponse(
+        status_code=502,
+        content={"detail": f"Upstream WHOOP error: {exc}"},
+    )
+
+
 def _meta() -> Meta:
     """Fresh per-response metadata (new UTC timestamp each call)."""
     return Meta()
+
+
+def _whoop_row_to_model(row: pd.Series) -> WhoopDaily:
+    """Rebuild a :class:`WhoopDaily` from one loader DataFrame row.
+
+    Mirrors the synthetic-CSV path: coerce NaN optionals back to ``None``
+    so the schema validates. No reshaping — the row already carries the
+    exact WhoopDaily fields.
+    """
+    rec = row.to_dict()
+    for field in _OPTIONAL_WHOOP_FIELDS:
+        value = rec.get(field)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            rec[field] = None
+    return WhoopDaily.model_validate(rec)
 
 
 @app.get(
@@ -182,6 +249,56 @@ async def daily_recommendation(
 
     recommendation = recommend_daily_workout(
         req.today, history_df, req.profile, plan
+    )
+    return DailyRecommendationResponse(
+        meta=_meta(), recommendation=recommendation
+    )
+
+
+@app.get(
+    "/me/today",
+    response_model=DailyRecommendationResponse,
+    tags=["recommendations"],
+    summary="Today's recommendation from live WHOOP data",
+    description=(
+        "Pull the configured athlete's WHOOP history (last 90 days, "
+        "disk-cached 6 h) and run the Phase 5 deterministic orchestrator "
+        "for today. No request body: WHOOP auth is via environment "
+        "credentials and the runner profile comes from `SAWE_*` env vars "
+        "(documented defaults otherwise). The data layer is the only "
+        "thing new here — the recommender, rules, metrics, and planner "
+        "are unchanged and the `Recommendation` is returned verbatim. "
+        "Upstream WHOOP failures map to 401 (auth), 429 (rate limit), or "
+        "502 (network/API)."
+    ),
+)
+async def me_today(
+    profile: RunnerProfile = Depends(get_runner_profile),
+) -> DailyRecommendationResponse:
+    # Data layer only (WhoopClient + normalizer behind the cache); the
+    # recommender wiring below is identical to /daily_recommendation —
+    # no training logic is introduced in the API (CLAUDE.md).
+    history = load_whoop_history(90)
+    if history.empty:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No WHOOP data available for the configured account. "
+                "Run `python -m src.ingest.auth_setup` and confirm the "
+                "WHOOP_* environment variables are set."
+            ),
+        )
+
+    ordered = history.sort_values("date").reset_index(drop=True)
+    today = _whoop_row_to_model(ordered.iloc[-1])
+    history_df = ordered.iloc[:-1].reset_index(drop=True)
+
+    # Anchor the planner week on today's date so the resolved plan always
+    # contains today's session (recommender raises ValueError otherwise →
+    # handled above as a 422).
+    plan = generate_weekly_plan(profile, 1, start_date=today.date)
+    recommendation = recommend_daily_workout(
+        today, history_df, profile, plan
     )
     return DailyRecommendationResponse(
         meta=_meta(), recommendation=recommendation
