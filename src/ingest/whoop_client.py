@@ -272,6 +272,16 @@ class WhoopClient:
         rotated = payload.get("refresh_token")
         if rotated and rotated != self.refresh_token:
             self.refresh_token = rotated
+            # Also publish to the process environment. WHOOP just
+            # single-used the old token, but ``load_dotenv`` will not
+            # override an already-set var, so a *second* WhoopClient
+            # constructed later in this same process (e.g. a diagnostic
+            # alongside the loader, or two callers sharing a worker) would
+            # otherwise read the now-dead token straight back from
+            # ``os.environ`` and hard-fail its first refresh. This keeps
+            # in-process siblings consistent even on env-var-only
+            # deployments where ``_persist_refresh_token`` has no file.
+            os.environ[_REFRESH_TOKEN_KEY] = rotated
             self._persist_refresh_token(rotated)
 
     def _persist_refresh_token(self, token: str) -> None:

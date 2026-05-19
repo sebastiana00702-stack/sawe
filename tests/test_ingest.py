@@ -17,6 +17,7 @@ calls**. Covers:
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -623,6 +624,47 @@ def test_client_does_not_rewrite_env_when_token_unchanged(tmp_path):
     assert client.refresh_token == "rtoken"
     assert env.read_text() == "WHOOP_REFRESH_TOKEN=rtoken\n"
     assert env.stat().st_mtime_ns == before  # not rewritten at all
+
+
+def test_rotated_token_visible_to_a_second_client_in_same_process(
+    monkeypatch,
+):
+    # Phase 7.5 footgun: WHOOP single-uses the old refresh token on
+    # rotation. If only self.refresh_token / .env are updated, a SECOND
+    # WhoopClient built from the environment later in this same process
+    # reads the now-dead token back (load_dotenv won't override an
+    # already-set var) and hard-fails its first refresh. Rotation must
+    # also publish the rotated token to os.environ. env_path is None here
+    # (load_env=False), so this also covers the env-var-only deployment
+    # path where _persist_refresh_token has no file to write.
+    monkeypatch.setenv("WHOOP_CLIENT_ID", "cid")
+    monkeypatch.setenv("WHOOP_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("WHOOP_REFRESH_TOKEN", "rtoken")
+
+    def rotating(req: httpx.Request) -> httpx.Response:
+        if _is_token(req):
+            return _ok_token("rotated_token")  # WHOOP rotates on every use
+        return httpx.Response(200, json={"records": []})
+
+    c1 = WhoopClient(
+        transport=httpx.MockTransport(rotating),
+        sleep=lambda _s: None,
+        load_env=False,
+    )
+    c1.get_recovery(date(2026, 5, 1), date(2026, 5, 18))
+    assert c1.refresh_token == "rotated_token"
+
+    # The single-used token must be gone from the process environment...
+    assert os.environ["WHOOP_REFRESH_TOKEN"] == "rotated_token"
+
+    # ...so a sibling client built from the env starts on the live token,
+    # not WHOOP's already-invalidated one (pre-fix: this was "rtoken").
+    c2 = WhoopClient(
+        transport=httpx.MockTransport(rotating),
+        sleep=lambda _s: None,
+        load_env=False,
+    )
+    assert c2.refresh_token == "rotated_token"
 
 
 def test_client_429_backs_off_then_succeeds():
