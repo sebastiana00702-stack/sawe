@@ -275,12 +275,26 @@ def test_normalize_unscored_recovery_raises():
         )
 
 
-def test_normalize_applies_timezone_offset_to_date():
-    # 02:00 UTC with a -05:00 offset is still the previous local day.
+def test_normalize_buckets_cycle_by_nearest_local_day_of_wake():
+    # A cycle ``start`` is the *wake* instant. 02:00 UTC at -05:00 is
+    # 21:00 the previous local evening — a late-evening wake belongs to
+    # the day the athlete wakes *into* (the nearest local day, here the
+    # 18th), matching WHOOP's own per-day labels. The naive local .date()
+    # (the 17th) is exactly the collision bug _whoop_day fixes.
     rec = recovery_rec(uid(5), uid(5))
     cyc = cycle_rec(uid(5), date(2026, 5, 18), tz="-05:00", start_hour=2)
     wd = normalize_whoop_day(rec, cyc, sleep_rec(uid(5)), [])
-    assert wd.date == date(2026, 5, 17)
+    assert wd.date == date(2026, 5, 18)
+
+
+def test_normalize_morning_wake_stays_on_that_local_day():
+    # Counterpart: a normal early-morning wake (06:00 local) stays put —
+    # the noon pivot only rolls the late-evening straddle cases forward.
+    rec = recovery_rec(uid(15), uid(15))
+    cyc = cycle_rec(uid(15), date(2026, 5, 18), tz="-05:00", start_hour=11)
+    wd = normalize_whoop_day(rec, cyc, sleep_rec(uid(15)), [])
+    # 11:00 UTC - 05:00 = 06:00 local on the 18th → the 18th.
+    assert wd.date == date(2026, 5, 18)
 
 
 def test_normalize_nonpositive_hrv_raises():
@@ -347,6 +361,131 @@ def test_merge_history_links_sorts_and_skips_incomplete():
     assert series[0].workout_strain == pytest.approx(7.0)
     assert series[1].recovery_score == 60
     assert series[1].workout_strain is None
+
+
+# --------------------------------------------------------------------------
+# Regression: real WHOOP v2 shapes, wake times straddling local midnight.
+#
+# These builders deliberately do NOT use the tidy uid()/cycle_rec() helpers
+# — those mask the production bug. Real WHOOP v2: cycle ``id`` /
+# recovery ``cycle_id`` are **integers**; sleep ``id`` / recovery
+# ``sleep_id`` are **UUID strings**; ``timezone_offset`` is a real offset
+# ("-04:00"); a cycle ``start`` is the *wake* instant, which drifts around
+# local midnight; today's still-running cycle has ``end: null`` but is
+# already ``SCORED`` with a partial strain. Verbatim from the production
+# /v2 dump that reproduced the 05-15 + 05-18 drop.
+# --------------------------------------------------------------------------
+
+_TZ = "-04:00"
+
+
+def _pcycle(cid: int, start: str, end, strain: float) -> dict:
+    """Production-shaped cycle: int id, real tz, ``end=None`` when open."""
+    return {
+        "id": cid,
+        "user_id": 1,
+        "start": start,
+        "end": end,
+        "timezone_offset": _TZ,
+        "score_state": "SCORED",
+        "score": {
+            "strain": strain,
+            "kilojoule": 8000.0,
+            "average_heart_rate": 60,
+            "max_heart_rate": 150,
+        },
+    }
+
+
+def _precovery(cid: int, sid: str, created: str, recovery: int) -> dict:
+    """Production-shaped recovery: int cycle_id, UUID sleep_id."""
+    return {
+        "cycle_id": cid,
+        "sleep_id": sid,
+        "user_id": 1,
+        "created_at": created,
+        "updated_at": created,
+        "score_state": "SCORED",
+        "score": {
+            "user_calibrating": False,
+            "recovery_score": recovery,
+            "resting_heart_rate": 48,
+            "hrv_rmssd_milli": 65.0,
+            "spo2_percentage": 96.0,
+            "skin_temp_celsius": 33.5,
+        },
+    }
+
+
+def _psleep(sid: str, start: str, *, nap: bool = False) -> dict:
+    s = sleep_rec(sid)
+    s["start"] = start
+    s["timezone_offset"] = _TZ
+    s["nap"] = nap
+    return s
+
+
+# UUIDs/ids/timestamps verbatim from the production diagnostic dump.
+_S14 = "5d265630-d328-4ae6-a862-cf6c1ae0b1c7"
+_S15 = "c3712649-e9dd-4694-ac51-8116d50fc9e8"
+_S16 = "867509f4-b9de-468c-840f-305d96d9319f"
+_S17 = "69f5de0d-3552-46f7-bcc2-64517549daf5"
+_SNAP = "c4e6f6ce-2485-4931-bdbf-e01e51d338ca"
+_S18 = "2002e494-c2f3-4d30-869e-9bf29227ef1d"
+
+
+def test_merge_history_keeps_every_cycle_when_wake_straddles_midnight():
+    # The exact production failure. Five SCORED recoveries (WHOOP returns
+    # them newest-first). Wake instants for the 05-15 and 05-18 cycles fall
+    # at 23:53 and 22:57 *local* (UTC-4) — i.e. the previous calendar day —
+    # so the old local-date bucketing collapsed 05-15→05-14 and 05-18→05-17
+    # and silently overwrote, dropping today's recovery (89) entirely.
+    client = FakeClient(
+        recoveries=[  # newest-first, as the WHOOP collection returns them
+            _precovery(1506892357, _S18, "2026-05-18T12:41:27.547Z", 89),
+            _precovery(1505059111, _S17, "2026-05-17T20:56:00.882Z", 6),
+            _precovery(1502437776, _S16, "2026-05-16T13:38:19.461Z", 62),
+            _precovery(1500170316, _S15, "2026-05-15T12:45:34.761Z", 55),
+            _precovery(1498069420, _S14, "2026-05-14T13:53:38.846Z", 48),
+        ],
+        cycles=[
+            _pcycle(1498069420, "2026-05-14T04:42:46.090Z",
+                    "2026-05-15T03:53:46.180Z", 13.1),
+            _pcycle(1500170316, "2026-05-15T03:53:46.180Z",
+                    "2026-05-16T05:27:50.100Z", 9.2),
+            _pcycle(1502437776, "2026-05-16T05:27:50.100Z",
+                    "2026-05-17T08:08:56.900Z", 16.55),
+            _pcycle(1505059111, "2026-05-17T08:08:56.900Z",
+                    "2026-05-18T02:57:32.380Z", 10.38),
+            # Today: still running — no end, but already SCORED.
+            _pcycle(1506892357, "2026-05-18T02:57:32.380Z", None, 4.5),
+        ],
+        sleeps=[
+            _psleep(_S14, "2026-05-14T04:42:46.090Z"),
+            _psleep(_S15, "2026-05-15T03:53:46.180Z"),
+            _psleep(_S16, "2026-05-16T05:27:50.100Z"),
+            _psleep(_S17, "2026-05-17T08:08:56.900Z"),
+            _psleep(_SNAP, "2026-05-17T16:08:26.730Z", nap=True),  # unlinked
+            _psleep(_S18, "2026-05-18T02:57:32.380Z"),
+        ],
+        workouts=[],
+    )
+    series = merge_history(date(2026, 5, 12), date(2026, 5, 18), client)
+
+    # Every distinct WHOOP cycle survives as its own day — nothing dropped.
+    assert [w.date for w in series] == [
+        date(2026, 5, 14),
+        date(2026, 5, 15),
+        date(2026, 5, 16),
+        date(2026, 5, 17),
+        date(2026, 5, 18),
+    ]
+    assert [w.recovery_score for w in series] == [48, 55, 62, 6, 89]
+    # Today (05-18): still-running cycle, end=None, but SCORED with a
+    # partial strain — it must be present and carry that strain.
+    assert series[-1].date == date(2026, 5, 18)
+    assert series[-1].day_strain == pytest.approx(4.5)
+    WhoopDaily.model_validate(series[-1].model_dump())
 
 
 # ==========================================================================

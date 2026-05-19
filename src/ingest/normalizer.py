@@ -100,10 +100,37 @@ def _parse_offset(offset: Optional[str]) -> timedelta:
 def _local_date(iso_start: str, tz_offset: Optional[str]) -> date:
     """Calendar date of an instant in the athlete's local timezone.
 
-    WHOOP timestamps are UTC; the day a cycle "belongs to" is its local
-    start date, so the offset is applied before taking ``.date()``.
+    WHOOP timestamps are UTC; apply the offset before taking ``.date()``.
+    Use this for *daytime* events (workouts) whose calendar date is simply
+    where they fall — never for a cycle/recovery, which is bucketed by
+    :func:`_whoop_day` instead (see below).
     """
     return (_parse_instant(iso_start) + _parse_offset(tz_offset)).date()
+
+
+def _whoop_day(iso_start: str, tz_offset: Optional[str]) -> date:
+    """The calendar day a WHOOP physiological cycle *belongs to*.
+
+    A cycle's ``start`` is the athlete's **wake** instant, and a WHOOP
+    cycle runs wake→wake, so that instant drifts around local midnight
+    from day to day. Taking the plain local ``.date()`` (``_local_date``)
+    of a wake that lands at, say, 23:53 local files the cycle under the
+    *previous* calendar day — and the next morning's wake (e.g. 04:00) then
+    collides on that same date, so one of two physically distinct cycles
+    was silently overwritten in ``merge_history`` (today's recovery was the
+    casualty). WHOOP instead attributes a cycle to the day the athlete
+    *wakes into and lives*: the **nearest** local day to the wake instant.
+
+    Implemented as a noon pivot — a wake before local noon stays on that
+    day, a wake at/after local noon rolls to the next. This is exact for
+    wake times, which are mornings or (on the straddle days) late evenings
+    and never midday. Verified against the production /v2 dump for an
+    athlete at UTC-4: it reproduces WHOOP's own per-day labels with no
+    collisions. ``day_strain`` for a still-running (``end: null``) current
+    cycle is unaffected — WHOOP already scores it with a partial strain.
+    """
+    local = _parse_instant(iso_start) + _parse_offset(tz_offset)
+    return (local + timedelta(hours=12)).date()
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -131,7 +158,7 @@ def normalize_whoop_day(
     cyc = _scored(cycle_json, "cycle")
     slp = _scored(sleep_json, "sleep")
 
-    day = _local_date(
+    day = _whoop_day(
         _require(cycle_json.get("start"), "cycle", "start"),
         cycle_json.get("timezone_offset"),
     )
@@ -273,8 +300,14 @@ def merge_history(
     links recovery→cycle→sleep by WHOOP's ``cycle_id``/``sleep_id``,
     attaches that day's workouts, and normalizes each day. Days whose
     triple is incomplete/unscored are skipped (a partial WHOOP day is
-    expected, not an error); the result is de-duplicated by date and
-    sorted ascending so the recommender's rolling windows are chronological.
+    expected, not an error). Each cycle is bucketed by :func:`_whoop_day`
+    (nearest local day to the wake instant), not its raw local date — a
+    wake straddling local midnight otherwise collapsed two distinct cycles
+    onto one date and silently dropped one (today's recovery). If two
+    *distinct* ``cycle_id``s still resolve to one date, that is raised as a
+    :class:`NormalizationError` rather than silently overwritten. The
+    result is sorted ascending so the recommender's rolling windows are
+    chronological.
     """
     recoveries = client.get_recovery(start_date, end_date)
     cycles = client.get_cycles(start_date, end_date)
@@ -292,20 +325,33 @@ def merge_history(
         workouts_by_day.setdefault(wd, []).append(w)
 
     by_date: dict[date, WhoopDaily] = {}
+    cycle_id_for_date: dict[date, Any] = {}
     for recovery in recoveries:
-        cycle = cycle_by_id.get(recovery.get("cycle_id"))
+        cyc_id = recovery.get("cycle_id")
+        cycle = cycle_by_id.get(cyc_id)
         sleep = sleep_by_id.get(recovery.get("sleep_id"))
         if cycle is None or sleep is None or not cycle.get("start"):
             continue
-        day = _local_date(cycle["start"], cycle.get("timezone_offset"))
+        day = _whoop_day(cycle["start"], cycle.get("timezone_offset"))
         try:
             whoop_day = normalize_whoop_day(
                 recovery, cycle, sleep, workouts_by_day.get(day, [])
             )
         except NormalizationError:
             continue
-        # Later cycles win if WHOOP returns more than one for a calendar
-        # day (e.g. naps split a cycle); recoveries arrive newest-last.
+        # One WHOOP physiological cycle == one day. Re-seeing the *same*
+        # cycle_id (pagination overlap) just refreshes it; two *distinct*
+        # cycle_ids landing on one date means the day-bucketing is wrong
+        # and would silently drop a real day's recovery — the exact Phase
+        # 7.x failure. Fail loud instead of overwriting.
+        prior = cycle_id_for_date.get(whoop_day.date)
+        if prior is not None and prior != cyc_id:
+            raise NormalizationError(
+                f"two distinct WHOOP cycles ({prior!r} and {cyc_id!r}) map "
+                f"to {whoop_day.date.isoformat()} — day-bucketing is "
+                "dropping a recovery; investigate _whoop_day / wake times"
+            )
+        cycle_id_for_date[whoop_day.date] = cyc_id
         by_date[whoop_day.date] = whoop_day
 
     return [by_date[d] for d in sorted(by_date)]
